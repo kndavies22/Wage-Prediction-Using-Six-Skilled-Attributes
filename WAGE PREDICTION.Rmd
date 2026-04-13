@@ -1,0 +1,878 @@
+---
+title: "Uncovering Player Archetypes in Global Football"
+author: "Kevin Davies"
+date: "`r Sys.Date()`"
+output: html_notebook
+---
+
+# Executive Summary
+
+This notebook presents a full data analysis pipeline applied to the FIFA 21 player
+dataset. The central research question is: **Can we predict a player's weekly wage
+from their six skill attributes and player type?**
+
+The analysis follows six stages:
+
+1. **Data Acquisition** — loading the FIFA 21 dataset directly from a published URL
+2. **Data Understanding** — exploring how player scores are constructed
+3. **Data Cleaning** — systematic framework covering irrelevant data, missing values,
+   variable types, numerical domains, duplicates, outliers, and consistency checks
+4. **Exploratory Data Analysis** — visualising distributions and relationships
+5. **Statistical Modelling** — multiple linear regression to predict player wage
+6. **Dimension Reduction** — PCA to identify underlying skill dimensions
+
+**Key findings:**
+- Dribbling is the strongest predictor of wage among the six skill scores
+- Player type (Defender/Forward) commands a ~50% wage premium over Midfielders
+  with identical skill scores
+- The model explains 44.2% of wage variation
+- PCA reveals two fundamental skill dimensions: technical attacking ability (PC1)
+  and defensive/physical ability (PC2)
+
+**Reproducibility note:** This notebook is fully self-contained. All data is loaded
+directly from a public URL. Running all chunks from top to bottom in order will
+reproduce all results exactly. A fixed random seed (set.seed(123)) is used for
+the PCA downsampling step to ensure identical results on every run.
+
+---
+
+# 1. Data Acquisition
+
+```{r message=FALSE, warning=FALSE}
+# Load required libraries
+library(tidyverse)
+library(corrplot)
+
+# Load raw dataset directly from Google Sheets published as CSV
+# No local file required — data loads automatically from URL
+soccer_raw <- read.csv(
+  "https://docs.google.com/spreadsheets/d/e/2PACX-1vRWpw5hL7DUtcb9k7NsVNsE4BPV9QPZ-w1uBTovoE6TbHDur3a0dwSCmiRjcZlyX-lQ3_PhfnkFfBhl/pub?gid=0&single=true&output=csv"
+)
+
+# Confirm successful load
+cat("Rows:", nrow(soccer_raw), "\n")
+cat("Columns:", ncol(soccer_raw), "\n")
+head(soccer_raw, 5)
+```
+
+The raw dataset contains 18,944 players across 106 columns, covering identity
+information, skill scores, sub-attributes, and market data. Each row represents
+one player.
+
+---
+
+# 2. Data Understanding
+
+## 2.1 What is the FIFA 21 Dataset?
+
+The FIFA 21 dataset contains player-level data from EA Sports' FIFA 21 video game.
+Each row represents one player. The key attributes fall into a few groups:
+
+- **Identity**: name, nationality, club, age, position
+- **Overall & Potential**: composite scores (0–100) representing current ability and ceiling
+- **Physical**: height, weight
+- **6 Summary Skill Scores** (0–100 each): Pace, Shooting, Passing, Dribbling, Defending, Physicality
+- **Detailed Sub-attributes (~30)**: e.g., `attacking_crossing`, `skill_dribbling`, `movement_sprint_speed`
+- **Market info**: value (EUR), wage (EUR)
+
+## 2.2 How Are Player Scores Calculated?
+
+FIFA 21 player ratings are not arbitrary numbers — they are the result of a structured,
+multi-stage process that transforms real world observations into a precise numerical scale.
+
+**Stage 1 — Data Collection**
+EA Sports employs over 6,000 volunteer scouts worldwide — coaches, professional scouts,
+and football analysts — who watch real matches and assess players across more than 35
+individual attributes.
+
+**Stage 2 — Transforming Raw Observations into 0–100**
+Take speed as a concrete example. A player's pace rating is anchored to a real athletic
+benchmark — the 100 metre sprint. A pace rating of 99 corresponds to approximately 9.8
+seconds for 100 metres — essentially world class sprinting speed. EA and their data
+partners use GPS tracking technology and match data to measure real sprint speeds during
+training and games, which are then converted to an equivalent 100 metre benchmark and
+placed on the 0 to 100 scale. The same principle applies to every other attribute —
+each one has a real world benchmark behind it.
+
+**Stage 3 — Combining Attributes into Summary Scores**
+Those individual attribute scores are then combined into the six summary scores.
+Each summary score is a weighted average of its underlying sub-attributes:
+
+```{r}
+# FIFA 21 score breakdown — documented from EA's attribute system
+score_breakdown <- tribble(
+  ~Summary_Score,  ~Key_Sub_Attributes,
+  "Pace",          "sprint_speed, acceleration",
+  "Shooting",      "finishing, shot_power, long_shots, volleys, penalties, heading_accuracy",
+  "Passing",       "short_passing, long_passing, vision, crossing, curve, free_kick_accuracy",
+  "Dribbling",     "dribbling, ball_control, agility, balance, reactions",
+  "Defending",     "standing_tackle, sliding_tackle, interceptions, defensive_awareness, heading_accuracy",
+  "Physicality",   "stamina, strength, jumping, aggression"
+)
+
+score_breakdown
+```
+
+**Stage 4 — The Position-Weighted Overall**
+The Overall rating is a position-weighted blend of the six summary scores, using
+position-specific coefficients that add up to 1. A striker's Overall weights Pace
+and Shooting most heavily. A central midfielder's Overall weights Passing and
+Dribbling. A centre-back's Overall weights Defending and Physicality.
+
+This means two players with the same Overall rating can have completely different
+skill profiles — which is exactly why looking at underlying archetypes is more
+informative than Overall rating alone.
+
+## 2.3 Variable Overview
+
+```{r}
+# Group all column names by attribute type to understand dataset structure
+names(soccer_raw) %>%
+  as_tibble() %>%
+  mutate(group = case_when(
+    grepl("^attacking_", value) ~ "Attacking sub-attrs",
+    grepl("^skill_", value)     ~ "Skill sub-attrs",
+    grepl("^movement_", value)  ~ "Movement sub-attrs",
+    grepl("^power_", value)     ~ "Power sub-attrs",
+    grepl("^mentality_", value) ~ "Mentality sub-attrs",
+    grepl("^defending_", value) ~ "Defending sub-attrs",
+    grepl("^gk_|^goalkeeping_", value) ~ "Goalkeeper attrs",
+    TRUE ~ "Identity / Summary"
+  )) %>%
+  count(group, name = "num_columns") %>%
+  arrange(desc(num_columns))
+```
+
+The dataset contains approximately 30 detailed sub-attributes grouped into
+attacking, skill, movement, power, mentality, and defending categories —
+providing a rich basis for identifying player archetypes.
+
+---
+
+# 3. Data Cleaning
+
+We follow a systematic framework covering eight categories of data quality checks:
+
+| # | Issue Type          | What we check                              |
+|---|---------------------|--------------------------------------------|
+| 1 | Irrelevant rows     | Goalkeepers removed — different attr space |
+| 2 | Irrelevant columns  | Administrative and redundant columns       |
+| 3 | Missing values      | NAs across all columns                     |
+| 4 | Variable types      | Correct data types for each column         |
+| 5 | Numerical domains   | Values within expected ranges              |
+| 6 | Duplicate rows      | Players recorded more than once            |
+| 7 | Outliers            | Extreme values in key numeric columns      |
+| 8 | Consistency         | Logical relationships between variables    |
+
+## 3.1 Remove Goalkeepers
+
+```{r}
+cat("Players with GK position:", sum(grepl("GK", soccer_raw$player_positions)), "\n")
+
+soccer <- soccer_raw %>%
+  filter(!grepl("GK", player_positions))
+
+cat("Remaining outfield players:", nrow(soccer), "\n")
+```
+
+**Justification:** Goalkeepers are excluded because they operate in a fundamentally
+different attribute space from outfield players. Their skill profile is dominated
+by goalkeeping-specific attributes — reflexes, diving, handling, kicking — that
+do not exist for outfield players. Including them would distort any clustering or
+modelling of outfield archetypes. They are not simply another archetype — their
+attribute structure is incomparable to outfield players.
+
+## 3.2 Remove Goalkeeper-Specific Columns
+
+```{r}
+# Two passes to ensure complete removal of all GK columns
+soccer <- soccer %>%
+  select(-matches("^gk_|^goalkeeping_")) %>%
+  select(-any_of(c(
+    "gk_diving", "gk_handling", "gk_kicking",
+    "gk_reflexes", "gk_speed", "gk_positioning"
+  )))
+
+cat("Columns after removing GK attrs:", ncol(soccer), "\n")
+```
+
+**Justification:** Goalkeeper-specific attribute columns contain no meaningful
+information for outfield players — they are either structurally empty or filled
+with zeros. Retaining them would introduce noise into the analysis without adding
+any useful signal.
+
+## 3.3 Remove Irrelevant Columns
+
+```{r}
+soccer <- soccer %>%
+  select(-any_of(c(
+    # Database identifiers — not player attributes
+    "sofifa_id", "player_url",
+    # Redundant identity — short_name and age are retained
+    "long_name", "dob",
+    # Contextual metadata — not skill attributes
+    "nationality", "club_name", "league_name", "league_rank",
+    # Financial — value_eur removed; wage_eur intentionally KEPT as target variable
+    "value_eur",
+    # Categorical descriptors — not numerical skill scores
+    "preferred_foot", "work_rate", "body_type", "real_face",
+    # Mostly missing (~40% NA) — not relevant to skill analysis
+    "release_clause_eur",
+    # Administrative metadata — not player skill attributes
+    "player_tags", "team_position", "loaned_from", "joined",
+    "nation_position", "nation_jersey_number", "team_jersey_number",
+    "contract_valid_until",
+    # Not direct skill measurements
+    "international_reputation", "player_traits",
+    # Completely empty — deprecated in FIFA 21, replaced by defensive_awareness
+    "defending_marking",
+    # Position rating columns — derived from skill attributes, therefore redundant
+    "ls", "st", "rs", "lw", "lf", "cf", "rf", "rw",
+    "lam", "cam", "ram", "lm", "lcm", "cm", "rcm", "rm",
+    "lwb", "ldm", "cdm", "rdm", "rwb", "lb", "lcb", "cb", "rcb", "rb"
+  )))
+
+cat("Columns after removing irrelevant vars:", ncol(soccer), "\n")
+```
+
+**Justification summary:**
+- Administrative columns (IDs, URLs, jersey numbers, contract dates) provide no
+  information about player skill and are irrelevant to our analysis questions.
+- `value_eur` is a market valuation influenced by many non-skill factors.
+  `wage_eur` is retained as our target variable for modelling.
+- `release_clause_eur` was mostly missing (~40% NA) and not relevant to skill analysis.
+- Position rating columns (e.g., `st`, `cam`, `cb`) are computed directly from the
+  skill sub-attributes already retained — keeping them would be redundant.
+- `defending_marking` was deprecated by EA Sports in FIFA 21 and contains no data.
+
+## 3.4 Check for Missing Values
+
+```{r}
+# Identify any columns with missing values
+na_summary <- colSums(is.na(soccer))
+na_summary[na_summary > 0] %>%
+  sort(decreasing = TRUE) %>%
+  as_tibble(rownames = "column") %>%
+  rename(missing = value)
+```
+
+```{r}
+cat("Total missing values:", sum(is.na(soccer)), "\n")
+cat("Total cells:", nrow(soccer) * ncol(soccer), "\n")
+cat("Missing %:", round(100 * sum(is.na(soccer)) /
+      (nrow(soccer) * ncol(soccer)), 2), "%\n")
+```
+
+## 3.5 Select Analysis Variables
+
+```{r}
+# Identity and target variable columns
+# wage_eur is retained as the target variable — NOT treated as a predictor
+# age is retained as it may independently influence wage
+soccer_context <- soccer %>%
+  select(short_name, player_positions, wage_eur, age)
+
+# Skill attributes — these will be the predictors in modelling
+soccer_style <- soccer %>%
+  select(
+    overall, potential,
+    pace, shooting, passing, dribbling, defending, physic,
+    height_cm, weight_kg,
+    weak_foot, skill_moves,
+    starts_with("attacking_"),
+    starts_with("skill_"),
+    starts_with("movement_"),
+    starts_with("power_"),
+    starts_with("mentality_"),
+    starts_with("defending_")
+  )
+
+# Combine into one clean analysis dataset
+soccer_clean <- bind_cols(soccer_context, soccer_style)
+
+cat("Final dataset:", nrow(soccer_clean), "players,", ncol(soccer_clean), "columns\n")
+```
+
+## 3.6 Check Variable Types
+
+```{r}
+# Verify data types — skill attributes should be numeric (int or num)
+# Identity columns (short_name, player_positions) will be chr — expected
+str(soccer_clean)
+```
+
+**Finding:** All skill attribute columns are stored as integers — correct for
+numerical analysis. Identity columns are character type as expected.
+
+## 3.7 Check Numerical Domains
+
+```{r}
+# Verify all numeric columns fall within expected ranges
+soccer_clean %>%
+  select(where(is.numeric)) %>%
+  summary()
+```
+
+```{r}
+# Flag zero wages — not realistic for a registered professional footballer
+cat("Players with zero wage:", sum(soccer_clean$wage_eur == 0), "\n")
+
+# Remove zero wage players
+# Zero wage is not realistic and likely represents missing or incorrectly recorded data
+# Since wage_eur is our target variable, rows with zero wage cannot be used in modelling
+soccer_clean <- soccer_clean %>%
+  filter(wage_eur > 0)
+
+cat("Players remaining after removing zero wage:", nrow(soccer_clean), "\n")
+```
+
+**Finding:** All skill scores fall within the expected 0–100 range. Height ranges
+from 155cm to 203cm and weight from 50kg to 110kg — both realistic. 195 players
+had a recorded wage of zero — removed as likely data recording errors.
+
+## 3.8 Check for Duplicate Rows
+
+```{r}
+duplicate_count <- sum(duplicated(soccer_clean))
+cat("Duplicate rows:", duplicate_count, "\n")
+```
+
+**Finding:** No duplicate rows found. Every row represents a unique player.
+
+## 3.9 Check for Outliers
+
+```{r fig.width=7, fig.height=4}
+ggplot(soccer_clean, aes(y = wage_eur)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  scale_y_log10(labels = scales::comma) +
+  labs(title = "Distribution of Player Wages (log scale)",
+       y = "Weekly Wage (EUR)") +
+  theme_minimal()
+```
+
+```{r}
+# Top 10 highest earning players
+soccer_clean %>%
+  arrange(desc(wage_eur)) %>%
+  select(short_name, player_positions, overall, wage_eur) %>%
+  head(10)
+```
+
+**Finding:** Wage is heavily right skewed. The top earners are world class players
+whose wages are legitimate real world values — not data errors. These genuine
+outliers reflect real world wage inequality in football and are retained.
+
+## 3.10 Consistency Check
+
+```{r}
+# A player's Overall should never exceed their Potential
+inconsistent <- sum(soccer_clean$overall > soccer_clean$potential)
+cat("Players where Overall exceeds Potential:", inconsistent, "\n")
+```
+
+**Finding:** No players have an Overall rating exceeding their Potential — the
+data is internally consistent on this logical relationship.
+
+```{r}
+cat("Final clean dataset:", nrow(soccer_clean), "players,",
+    ncol(soccer_clean), "columns\n")
+```
+
+---
+
+# 4. Exploratory Data Analysis (EDA)
+
+## 4.1 Distribution of Overall Ratings
+
+```{r fig.width=8, fig.height=4}
+ggplot(soccer_clean, aes(x = overall)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Overall Ratings — FIFA 21 Outfield Players",
+    x = "Overall Rating", y = "Number of Players"
+  ) +
+  theme_minimal()
+```
+
+The distribution is approximately normal, with most players clustering between
+60 and 70. Truly elite players rated 85 and above are rare, reflecting the real
+world scarcity of world class talent.
+
+## 4.2 Messi's Six Skill Scores — A Concrete Example
+
+```{r fig.width=8, fig.height=4}
+messi <- soccer_clean %>%
+  filter(short_name == "L. Messi") %>%
+  select(short_name, pace, shooting, passing, dribbling, defending, physic) %>%
+  pivot_longer(-short_name, names_to = "skill", values_to = "score")
+
+ggplot(messi, aes(x = reorder(skill, score), y = score, fill = skill)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  geom_text(aes(label = score), hjust = -0.3, size = 4) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 110)) +
+  labs(
+    title = "Messi's Six Skill Scores — FIFA 21",
+    subtitle = "Overall: 93 | Position: RW, ST, CF",
+    x = "Skill", y = "Score"
+  ) +
+  theme_minimal()
+```
+
+Messi's Overall of 93 is built primarily on elite Dribbling (95), Shooting (92),
+and Passing (91). His Defending score of 38 is very low — yet his Overall remains
+93 because his position weights attacking skills heavily. This illustrates why
+Overall alone is insufficient to describe a player's full skill profile.
+
+## 4.3 Distributions of the 6 Summary Skill Scores
+
+```{r fig.width=10, fig.height=6}
+soccer_clean %>%
+  select(pace, shooting, passing, dribbling, defending, physic) %>%
+  pivot_longer(everything(), names_to = "skill", values_to = "score") %>%
+  ggplot(aes(x = score, fill = skill)) +
+  geom_histogram(binwidth = 3, color = "white", show.legend = FALSE) +
+  facet_wrap(~skill, ncol = 3) +
+  labs(title = "Distributions of the 6 FIFA 21 Skill Scores",
+       x = "Score", y = "Count") +
+  theme_minimal()
+```
+
+Defending shows a bimodal distribution reflecting the attacker-defender divide.
+Shooting is widely spread suggesting high variability in attacking ability.
+Dribbling and Physicality are more normally distributed, while Pace is left skewed.
+
+## 4.4 Boxplots by Broad Position Group
+
+```{r fig.width=10, fig.height=5}
+soccer_eda <- soccer_clean %>%
+  mutate(position_group = case_when(
+    grepl("CB|LB|RB|LWB|RWB", player_positions) ~ "Defender",
+    grepl("CDM|CM|CAM|LM|RM", player_positions)  ~ "Midfielder",
+    grepl("ST|CF|LW|RW|LF|RF", player_positions) ~ "Forward",
+    TRUE ~ "Other"
+  )) %>%
+  filter(position_group != "Other")
+
+soccer_eda %>%
+  select(position_group, pace, shooting, passing, dribbling, defending, physic) %>%
+  pivot_longer(-position_group, names_to = "skill", values_to = "score") %>%
+  ggplot(aes(x = position_group, y = score, fill = position_group)) +
+  geom_boxplot(show.legend = FALSE, alpha = 0.7) +
+  facet_wrap(~skill, ncol = 3) +
+  labs(title = "Skill Score Distributions by Position Group",
+       x = "Position Group", y = "Score") +
+  theme_minimal()
+```
+
+Clear position-based patterns emerge. Defending shows the biggest separation —
+defenders score around 65 on average while forwards score as low as 25–30.
+Forwards are highest on Shooting. Midfielders are the most balanced group.
+Pace is similar across all three groups suggesting speed is a universal requirement.
+
+## 4.5 Correlation Matrix of Skill Scores
+
+```{r fig.width=7, fig.height=6}
+skill_cols <- soccer_clean %>%
+  select(overall, pace, shooting, passing, dribbling, defending, physic) %>%
+  drop_na()
+
+cor_matrix <- cor(skill_cols)
+
+corrplot(cor_matrix,
+         method = "color", type = "upper",
+         addCoef.col = "black", tl.col = "black",
+         number.cex = 0.8,
+         title = "Correlation Matrix of FIFA 21 Skill Scores",
+         mar = c(0, 0, 2, 0))
+```
+
+The strongest positive relationship is between Passing and Dribbling (0.83).
+Shooting and Defending show a negative correlation (–0.40), confirming the
+attacker-defender divide. Shooting and Physicality (0.02) are essentially
+uncorrelated — physical strength is an independent dimension. These widespread
+correlations motivate the use of PCA to identify independent underlying dimensions.
+
+---
+
+# 5. Statistical Modelling — Predicting Player Wage
+
+## 5.1 Research Question
+
+**Can we predict a player's weekly wage from their six skill attributes and player type?**
+
+We use **multiple linear regression** — a method that models the relationship between
+a target variable and multiple predictors simultaneously. The target variable is
+`wage_eur` — what we are trying to predict. The predictors are the six skill scores,
+age, and player type.
+
+Raw wage is heavily right skewed — the median is €3,000 but the maximum is €560,000.
+A linear regression applied to raw wage would be distorted by extreme earners. We
+therefore apply a **log transformation** to wage before modelling, which compresses
+the scale and makes the distribution more suitable for linear regression.
+
+## 5.2 Add Player Type as a Categorical Variable
+
+```{r}
+# Classify players into three position groups
+# player_type is included as a categorical predictor — position may influence
+# wage independently of skill scores
+soccer_model <- soccer_clean %>%
+  mutate(player_type = case_when(
+    grepl("CB|LB|RB|LWB|RWB", player_positions) ~ "Defender",
+    grepl("CDM|CM|CAM|LM|RM", player_positions)  ~ "Midfielder",
+    grepl("ST|CF|LW|RW|LF|RF", player_positions) ~ "Forward",
+    TRUE ~ "Other"
+  )) %>%
+  filter(player_type != "Other") %>%
+  mutate(
+    # Midfielder set as reference category — largest and most balanced group
+    # All Defender and Forward coefficients interpreted relative to Midfielder
+    player_type = factor(player_type, levels = c("Midfielder", "Defender", "Forward")),
+    log_wage = log(wage_eur)
+  )
+
+cat("Players in model dataset:", nrow(soccer_model), "\n")
+cat("Player type distribution:\n")
+table(soccer_model$player_type)
+```
+
+Midfielder is set as the reference category — all Defender and Forward coefficients
+are interpreted relative to a Midfielder with the same skill scores. Midfielder
+was chosen as the reference because it is the largest group (7,094 players) and
+the most balanced position in terms of skill attributes.
+
+## 5.3 Visualise Log Wage Distribution
+
+```{r fig.width=8, fig.height=4}
+ggplot(soccer_model, aes(x = log_wage)) +
+  geom_histogram(binwidth = 0.3, fill = "steelblue", color = "white") +
+  scale_x_continuous(
+    breaks = log(c(500, 1000, 2000, 3000, 10000, 50000, 200000)),
+    labels = c("€500", "€1K", "€2K", "€3K", "€10K", "€50K", "€200K")
+  ) +
+  labs(
+    title = "Distribution of Log-Transformed Weekly Wage",
+    x = "Weekly Wage (EUR)", y = "Count"
+  ) +
+  theme_minimal()
+```
+
+The distribution remains bimodal after log transformation — two distinct peaks
+around €500 and €2,000 per week — reflecting the two tier wage structure in
+professional football. There is a real gap between €1,000 and €2,000 reflecting
+the wage cliff between lower league and top league football.
+
+## 5.4 Fit the Regression Model
+
+```{r}
+# Multiple linear regression
+# Target: log(wage_eur)
+# Predictors: six skill scores + age + player type (categorical)
+model <- lm(log_wage ~ pace + shooting + passing + dribbling +
+              defending + physic + age + player_type,
+            data = soccer_model)
+
+summary(model)
+```
+
+## 5.5 Interpret the Coefficients
+
+```{r}
+broom::tidy(model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    p.value = round(p.value, 4),
+    significant = ifelse(p.value < 0.05, "Yes", "No")
+  ) %>%
+  select(term, estimate, std.error, p.value, significant)
+```
+
+**Interpreting numerical predictors** — each coefficient tells us how much log wage
+changes for a one unit increase in that skill score, holding all other predictors constant:
+
+- **Dribbling (0.052):** The strongest skill predictor. Each one point increase in
+  dribbling is associated with a 5.2% increase in log wage. On the original wage
+  scale, a 10 point increase in dribbling corresponds to approximately e^(0.052×10) - 1
+  = 68% higher weekly wage, all else equal.
+- **Physicality (0.028):** Each one point increase is associated with a 2.8% increase
+  in log wage. Physical players are well rewarded in the market.
+- **Shooting (0.018), Defending (0.017), Passing (0.016):** All positive — better
+  skilled players in these areas earn more, all else equal.
+- **Pace (-0.007):** The only negative skill predictor. Pure pace alone, when all
+  other skills are held constant, is associated with a slight decrease in log wage.
+  Pace without supporting technical skills does not command a wage premium.
+- **Age (-0.006):** Each additional year of age is associated with a 0.6% lower
+  log wage when skill level is controlled for.
+
+**Interpreting the categorical predictor — player type:**
+
+- **Defender (+0.422):** Holding all skill scores and age constant, a Defender earns
+  approximately e^0.422 - 1 = **52% more** than a Midfielder with identical attributes
+  on the original wage scale.
+- **Forward (+0.403):** A Forward earns approximately e^0.403 - 1 = **50% more** than
+  a Midfielder with identical skill scores on the original wage scale.
+
+Position itself commands a significant wage premium independent of skill level.
+
+## 5.6 Overall Model Fit
+
+```{r}
+cat("R-squared:", round(summary(model)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model)$adj.r.squared, 4), "\n")
+```
+
+**R-squared: 0.442** — the model explains 44.2% of the variation in player wages.
+The remaining 55.8% is driven by factors not in our model — club size, league,
+commercial value, and contract negotiations.
+
+**Adjusted R-squared: 0.4417** — almost identical to R-squared, confirming all
+eight predictors are genuinely contributing and none are adding noise.
+
+## 5.7 Check Model Assumptions
+
+```{r fig.width=10, fig.height=8}
+par(mfrow = c(2, 2))
+plot(model)
+```
+
+**Residuals vs Fitted:** Slight curve in the red line — indicating some non-linearity.
+The model makes systematic errors at certain wage levels.
+
+**Normal Q-Q:** Points follow the diagonal line well in the middle but curve away
+at both ends — heavy tails — meaning larger errors at extreme wage values.
+
+**Scale-Location:** Red line slopes upward — the model is less accurate for higher
+wage players, violating the constant variance assumption.
+
+**Residuals vs Leverage:** Red line is flat and no points fall outside Cook's distance
+boundaries — no single player is distorting the model.
+
+**Overall assessment:** The model satisfies the leverage assumption but shows
+violations of linearity and constant variance — consistent with the bimodal wage
+structure. Recommendations: model the two wage tiers separately, or explore
+mixture models to better account for this structure.
+
+## 5.8 Visualise Predicted vs Actual Wage
+
+```{r fig.width=8, fig.height=5}
+soccer_model$predicted_log_wage <- predict(model, soccer_model)
+
+ggplot(soccer_model, aes(x = predicted_log_wage, y = log_wage)) +
+  geom_point(alpha = 0.2, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(
+    title = "Predicted vs Actual Log Wage",
+    x = "Predicted Log Wage", y = "Actual Log Wage"
+  ) +
+  theme_minimal()
+```
+
+Points close to the red diagonal line indicate accurate predictions. The model
+performs well for average players but consistently underestimates elite earners.
+The horizontal banding reflects the discrete nature of FIFA 21 wages recorded
+in round numbers. This is consistent with the R-squared of 0.442.
+
+---
+
+# 6. Dimension Reduction — PCA
+
+## 6.1 Why PCA?
+
+Our dataset contains 28 skill sub-attributes — many of which are correlated with
+each other. For example, Passing and Dribbling have a correlation of 0.83. When
+many variables move together like this, it is difficult to identify what truly
+and independently separates players from each other.
+
+**Principal Component Analysis (PCA)** addresses this by:
+- Taking all 28 correlated sub-attributes
+- Finding new **uncorrelated** dimensions called principal components
+- Each component captures a different independent source of variation
+- A small number of components can represent most of the information
+
+In short — PCA finds the underlying skill dimensions that truly separate players,
+rather than looking at 28 correlated attributes individually. This connects directly
+to the core goal of this project — uncovering player archetypes.
+
+## 6.2 Prepare Data for PCA
+
+```{r}
+# Select only the detailed sub-attributes for PCA
+# Summary scores (overall, pace etc.) excluded — derived from sub-attributes
+# skill_moves excluded — it is a 1-5 star rating, not a continuous sub-attribute
+# Wage, age, and identity columns excluded
+
+# Downsample to create genuinely high dimensional data (more columns than rows)
+# as recommended — 25 players, 28 sub-attribute columns
+# set.seed ensures reproducibility — same 25 players on every run
+set.seed(123)
+
+pca_data <- soccer_clean %>%
+  select(
+    starts_with("attacking_"),
+    starts_with("skill_"),
+    starts_with("movement_"),
+    starts_with("power_"),
+    starts_with("mentality_"),
+    starts_with("defending_")
+  ) %>%
+  select(-skill_moves) %>%
+  drop_na() %>%
+  sample_n(25)
+
+cat("Rows:", nrow(pca_data), "\n")
+cat("Columns:", ncol(pca_data), "\n")
+```
+
+The dataset is downsampled to 25 players and 28 sub-attribute columns — creating
+a genuinely high dimensional structure where the number of variables exceeds the
+number of observations. `set.seed(123)` ensures the same 25 players are selected
+on every run, guaranteeing reproducibility.
+
+## 6.3 Run PCA
+
+```{r}
+# Center and scale all attributes before PCA
+# Centering: subtracts the mean so all attributes have mean zero
+# Scaling: divides by SD so all attributes have equal variance
+# Essential — without scaling, high-variance attributes would dominate the components
+pca_result <- prcomp(pca_data, center = TRUE, scale. = TRUE)
+
+summary(pca_result)
+```
+
+## 6.4 Scree Plot — How Many Components Do We Need?
+
+```{r fig.width=8, fig.height=4}
+variance_explained <- pca_result$sdev^2 / sum(pca_result$sdev^2) * 100
+cumulative_variance <- cumsum(variance_explained)
+
+scree_data <- tibble(
+  component = 1:length(variance_explained),
+  variance = variance_explained,
+  cumulative = cumulative_variance
+)
+
+ggplot(scree_data %>% filter(component <= 10), aes(x = component, y = variance)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7) +
+  geom_line(aes(y = cumulative), color = "red", size = 1) +
+  geom_point(aes(y = cumulative), color = "red", size = 2) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Scree Plot — Variance Explained by Each Principal Component",
+    x = "Principal Component", y = "Variance Explained (%)",
+    caption = "Red line shows cumulative variance explained"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+cat("Components needed to explain 80% of variance:",
+    which(cumulative_variance >= 80)[1], "\n")
+cat("Variance explained by first 3 components:",
+    round(cumulative_variance[3], 1), "%\n")
+```
+
+PC1 alone explains approximately 42% of all variance — the single most important
+dimension separating players. The first three components together explain 70.5%
+of variance. Six components are needed to explain 80% — meaning the 28 sub-attributes
+can be compressed into just 6 independent dimensions without losing much information.
+
+## 6.5 Visualise Players in PCA Space
+
+```{r fig.width=9, fig.height=6}
+pca_df <- as.data.frame(pca_result$x) %>%
+  bind_cols(
+    soccer_clean %>%
+      drop_na() %>%
+      sample_n(25, replace = FALSE) %>%
+      mutate(player_type = case_when(
+        grepl("CB|LB|RB|LWB|RWB", player_positions) ~ "Defender",
+        grepl("CDM|CM|CAM|LM|RM", player_positions)  ~ "Midfielder",
+        grepl("ST|CF|LW|RW|LF|RF", player_positions) ~ "Forward",
+        TRUE ~ "Other"
+      )) %>%
+      select(player_type)
+  )
+
+ggplot(pca_df %>% filter(player_type != "Other"),
+       aes(x = PC1, y = PC2, color = player_type)) +
+  geom_point(alpha = 0.7, size = 3) +
+  labs(
+    title = "Players in PCA Space — PC1 vs PC2",
+    x = "PC1 — Technical Attacking Ability",
+    y = "PC2 — Defensive & Physical Ability",
+    color = "Player Type"
+  ) +
+  theme_minimal()
+```
+
+## 6.6 Interpret the Principal Components
+
+```{r}
+loadings <- as.data.frame(pca_result$rotation[, 1:3])
+loadings$attribute <- rownames(loadings)
+
+# PC1 — top 10 attributes by absolute loading
+loadings %>%
+  select(attribute, PC1) %>%
+  arrange(desc(abs(PC1))) %>%
+  head(10)
+```
+
+```{r}
+# PC2 — top 10 attributes by absolute loading
+loadings %>%
+  select(attribute, PC2) %>%
+  arrange(desc(abs(PC2))) %>%
+  head(10)
+```
+
+**PC1 — Technical Attacking Ability**
+The attributes with the highest loadings on PC1 are all attacking and technical:
+skill_dribbling, skill_ball_control, power_long_shots, mentality_vision,
+mentality_positioning, skill_curve, attacking_finishing. PC1 measures how
+technically gifted and attack-minded a player is. Players who score high on PC1
+are technically elite attackers. Players who score low are more defensive.
+
+**PC2 — Defensive & Physical Ability**
+The attributes with the highest loadings on PC2 are all defensive and physical:
+mentality_interceptions (-0.370), defending_standing_tackle (-0.361),
+defending_sliding_tackle (-0.350), mentality_aggression (-0.341),
+power_strength (-0.253). PC2 measures how defensively strong and physically
+powerful a player is.
+
+**Football interpretation:**
+The two most fundamental dimensions separating professional footballers are:
+1. How technically gifted and attack-minded you are — PC1
+2. How defensively strong and physically powerful you are — PC2
+
+This mathematically confirms the attacker-defender divide observed throughout
+the EDA — it is the most fundamental structural pattern in the data.
+
+---
+
+# 7. Summary
+
+**What this notebook establishes:**
+
+- FIFA 21 scores are not arbitrary — they are position-weighted composites of
+  ~30 sub-attributes anchored to real world athletic benchmarks
+- Data cleaning followed a comprehensive systematic 8-step framework with clear
+  justifications for every decision
+- EDA reveals clear position-based structure — distinct attacker, midfielder,
+  and defender profiles exist
+- Multiple linear regression explains 44.2% of wage variation. Dribbling is the
+  strongest skill predictor. Defenders and Forwards earn ~50-52% more than
+  Midfielders with identical skills on the original wage scale. The model shows
+  assumption violations consistent with the bimodal wage structure.
+- PCA on a high dimensional sample (25 players, 28 attributes) reveals two
+  fundamental skill dimensions: **technical attacking ability** (PC1, ~42% of
+  variance) and **defensive/physical ability** (PC2, ~19% of variance).
+  Six components explain 80% of all variance.
+
+**Potential next steps:**
+- Model the two wage tiers separately to address the bimodal structure
+- Cluster players into archetypes using PCA components
+- Explore more complex modelling techniques
