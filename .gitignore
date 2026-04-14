@@ -1,0 +1,21 @@
+# R project files
+*.Rproj
+.Rproj.user/
+
+# R history and workspace
+.Rhistory
+.RData
+.Ruserdata
+
+# R environment
+renv/library/
+renv/staging/
+
+# Knitted output files (optional - remove these lines if you want to track outputs)
+output/
+*.html
+*.pdf
+
+# OS files
+.DS_Store
+Thumbs.db
