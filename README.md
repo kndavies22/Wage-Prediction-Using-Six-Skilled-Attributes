@@ -23,7 +23,7 @@ Wage-Prediction-Using-Six-Skilled-Attributes/
 
 ## Dataset
 
-The data used in this project is the **FIFA 21 Complete Player Dataset**, sourced from a publicly available Google Sheets URL. No local data file is required — the dataset is loaded automatically when the `.Rmd` file is run.
+The data used in this project is the **FIFA 21 Complete Player Dataset**, sourced from a publicly available Google Sheets URL. No local data file is required  the dataset is loaded automatically when the `.Rmd` file is run.
 
 **Direct data URL:**
 ```
