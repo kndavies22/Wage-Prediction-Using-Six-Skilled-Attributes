@@ -782,6 +782,7 @@ can be compressed into just 6 independent dimensions without losing much informa
 ## 6.5 Visualise Players in PCA Space
 
 ```{r fig.width=9, fig.height=6}
+set.seed(123)
 pca_df <- as.data.frame(pca_result$x) %>%
   bind_cols(
     soccer_clean %>%
