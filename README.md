@@ -15,7 +15,7 @@ Wage-Prediction-Using-Six-Skilled-Attributes/
 ├── .gitignore
 │
 ├── report/
-│   └── wage_prediction.Rmd
+│   └── WAGE_PREDICTION.Rmd
 │
 ├── output/
 └── R/
