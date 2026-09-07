@@ -67,7 +67,7 @@ install.packages(c("tidyverse", "corrplot", "broom"))
 
 ## Key Findings
 
-- Dribbling is the strongest predictor of wage among the six skill scores
+- Dribbling is the strongest predictor of wage among the six skill attributes
 - Defenders and Forwards earn ~50-52% more than Midfielders with identical skill scores
 - The regression model explains 44.2% of wage variation (R² = 0.442)
 - PCA reveals two fundamental skill dimensions: technical attacking ability (PC1) and defensive/physical ability (PC2)
